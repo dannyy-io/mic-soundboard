@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.0
+- New: "+ From YouTube" button. Paste a YouTube link (TikTok, SoundCloud and many other sites work too) and its audio is downloaded and added as a new sound automatically.
+- The first time, it downloads the downloader (about 80 MB). It keeps itself updated, because YouTube changes often.
+- Videos up to 15 minutes. Use Trim afterwards to cut it down to the part you want.
+- Removing a downloaded sound also deletes its file, so it doesn't take up space.
+
 ## 1.2.0
 - New: Trim sounds. Right-click a sound and choose Trim to cut off a long intro or ending. Drag the start and end lines on the waveform, and press Preview to hear it in your headphones only. Your original file isn't changed. Trimmed sounds show a ✂ on their button.
 - Removing a sound now asks first, and a hint under the buttons shows what right-click can do.

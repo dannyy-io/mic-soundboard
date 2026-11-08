@@ -17,9 +17,12 @@ import importlib.util
 import json
 import os
 import queue
+import re
+import shutil
 import socket
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 from collections import deque
@@ -94,6 +97,14 @@ AUDIO_EXTS = (".wav", ".mp3", ".flac", ".ogg", ".aiff", ".aif")
 AUDIO_TYPES = [("Audio files", " ".join("*" + e for e in AUDIO_EXTS)), ("All files", "*.*")]
 COLUMNS = 4
 OFF = "(off)"
+SOUNDS_DIR = os.path.join(DATA_DIR, "sounds")        # where downloaded sounds are saved
+BIN_DIR = os.path.join(DATA_DIR, "bin")
+DL_STATE_PATH = os.path.join(DATA_DIR, "downloader.json")
+DL_PACKAGES = ["yt-dlp[default]", "imageio-ffmpeg"]
+DL_OPTIONAL = ["deno"]                              # JavaScript runtime that YouTube downloads need
+DL_UPDATE_EVERY = 2 * 24 * 60 * 60                  # keep the downloader fresh; YouTube changes often
+DL_MAX_MINUTES = 15
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 CABLE_WORDS = ("cable input", "voicemeeter input", "voicemeeter aux input", "vb-audio")
 
 
@@ -363,6 +374,271 @@ class Mixer:
         with self.lock:
             self._mix_voices(out, "monitor", self.sound_gain * self.monitor_gain)
         self._write(outdata, out)
+
+
+# ───────────────────────────── downloading from links ─────────────────────────────
+
+def _dl_state():
+    try:
+        with open(DL_STATE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_dl_state(**values):
+    st = _dl_state()
+    st.update(values)
+    try:
+        with open(DL_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+    except OSError:
+        pass
+
+
+def _pip(*args):
+    proc = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--disable-pip-version-check", *args],
+                          capture_output=True, text=True, creationflags=NO_WINDOW)
+    return proc.returncode == 0, (proc.stderr or proc.stdout or "")[-400:]
+
+
+def ffmpeg_dir():
+    """Folder with an ffmpeg program in it (yt-dlp needs one to convert audio), or None."""
+    name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    if os.path.exists(os.path.join(BIN_DIR, name)):
+        return BIN_DIR
+    try:
+        importlib.invalidate_caches()
+        import imageio_ffmpeg
+        os.makedirs(BIN_DIR, exist_ok=True)
+        shutil.copy2(imageio_ffmpeg.get_ffmpeg_exe(), os.path.join(BIN_DIR, name))  # yt-dlp wants this exact name
+        if os.name != "nt":
+            os.chmod(os.path.join(BIN_DIR, name), 0o755)
+        return BIN_DIR
+    except Exception:
+        found = shutil.which("ffmpeg")
+        return os.path.dirname(found) if found else None
+
+
+def downloader_installed():
+    importlib.invalidate_caches()
+    return importlib.util.find_spec("yt_dlp") is not None and ffmpeg_dir() is not None
+
+
+def install_downloader():
+    """Install or update yt-dlp, ffmpeg and deno. Returns (ok, message)."""
+    ok, msg = _pip("-U", *DL_PACKAGES)
+    if not ok:
+        return False, msg
+    _pip("-U", *DL_OPTIONAL)       # best effort
+    if ffmpeg_dir() is None:
+        return False, "Couldn't set up ffmpeg."
+    _save_dl_state(updated=time.time())
+    return True, ""
+
+
+def _tool_env():
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    extra = [p for p in (sysconfig.get_path("scripts"), BIN_DIR) if p]   # where deno and ffmpeg live
+    env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
+    return env
+
+
+def friendly_download_error(text):
+    low = text.lower()
+    if "sign in to confirm" in low and "age" in low:
+        return "That video is age-restricted, so it can't be downloaded without signing in."
+    if "not a bot" in low or "sign in to confirm" in low:
+        return "YouTube wants to check that you're not a bot. Wait a few minutes and try again."
+    if "private video" in low:
+        return "That video is private."
+    if "unsupported url" in low or "is not a valid url" in low:
+        return "That doesn't look like a video link."
+    if "http error 404" in low:
+        return "That link doesn't lead to anything (page not found)."
+    if "video unavailable" in low or "not available" in low:
+        return "That video isn't available (it may be deleted, private, or blocked)."
+    return re.sub(r"^ERROR:\s*", "", text.strip())[-300:] or "The download failed."
+
+
+def download_audio(url, report):
+    """Download a link's audio as a 48 kHz WAV in data/sounds. Returns (title, path).
+    report(kind, value) is called with ("progress", percent) and ("status", text)."""
+    os.makedirs(SOUNDS_DIR, exist_ok=True)
+    cmd = [sys.executable, "-m", "yt_dlp", url,
+           "--no-playlist", "--windows-filenames", "--newline", "--progress", "--no-simulate",
+           "--progress-template", "download:PROG %(progress._percent_str)s",
+           "-f", "bestaudio/best", "-x", "--audio-format", "wav",
+           "--postprocessor-args", "ExtractAudio:-ar 48000",
+           "--ffmpeg-location", ffmpeg_dir() or "",
+           "--match-filter", f"duration <=? {DL_MAX_MINUTES * 60}",
+           "--max-filesize", "300M",
+           "-o", os.path.join(SOUNDS_DIR, "%(title).80B [%(id)s].%(ext)s"),
+           "-O", "after_move:%(.{title,filepath})j"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                            errors="replace", env=_tool_env(), creationflags=NO_WINDOW, bufsize=1)
+    result, errors = None, []
+    for line in proc.stdout:
+        line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+        if line.startswith("PROG"):
+            m = re.search(r"([\d.]+)%", line)
+            if m:
+                report("progress", float(m.group(1)))
+        elif line.startswith("{"):
+            try:
+                result = json.loads(line)
+            except ValueError:
+                pass
+        elif "ERROR" in line:
+            errors.append(line)
+        elif "[ExtractAudio]" in line:
+            report("status", "Converting...")
+    proc.wait()
+    if result and result.get("filepath") and os.path.exists(result["filepath"]):
+        return result.get("title") or os.path.basename(result["filepath"]), result["filepath"]
+    if errors:
+        raise RuntimeError(friendly_download_error(errors[-1]))
+    raise RuntimeError(f"Nothing was downloaded. Videos longer than {DL_MAX_MINUTES} minutes are skipped, "
+                       "so try a shorter one.")
+
+
+class LinkDialog:
+    """Paste a YouTube (or TikTok, SoundCloud...) link; its audio becomes a new sound."""
+
+    def __init__(self, app):
+        self.app = app
+        self.q = queue.Queue()
+        self.busy = False
+        w = self.win = tk.Toplevel(app.root)
+        w.title("Add a sound from a link")
+        w.transient(app.root)
+        w.resizable(False, False)
+        w.protocol("WM_DELETE_WINDOW", self.close)
+
+        ttk.Label(w, text="Paste a YouTube link (TikTok, SoundCloud and many other sites work too):").pack(
+            anchor="w", padx=12, pady=(12, 4))
+        row = ttk.Frame(w)
+        row.pack(fill="x", padx=12)
+        self.url_var = tk.StringVar(value=self.clipboard_link())
+        self.entry = ttk.Entry(row, textvariable=self.url_var, width=60)
+        self.entry.pack(side="left", fill="x", expand=True)
+        self.entry.bind("<Return>", lambda e: self.start())
+        ttk.Button(row, text="Paste", command=self.paste).pack(side="left", padx=(6, 0))
+
+        row2 = ttk.Frame(w)
+        row2.pack(fill="x", padx=12, pady=10)
+        self.go_btn = ttk.Button(row2, text="Download & add", command=self.start)
+        self.go_btn.pack(side="left")
+        self.bar = ttk.Progressbar(row2, length=260, maximum=100)
+        self.bar.pack(side="left", padx=10)
+        self.msg = ttk.Label(w, text=f"Videos up to {DL_MAX_MINUTES} minutes. You can trim the sound afterwards "
+                                     "(right-click it → Trim).", foreground="#666", wraplength=520, justify="left")
+        self.msg.pack(anchor="w", padx=12, pady=(0, 12))
+        self.entry.focus_set()
+        self.entry.select_range(0, "end")
+        self.poll()
+
+    def clipboard_link(self):
+        try:
+            text = self.app.root.clipboard_get().strip()
+            return text if text.startswith("http") and "\n" not in text else ""
+        except Exception:
+            return ""
+
+    def paste(self):
+        try:
+            self.url_var.set(self.app.root.clipboard_get().strip())
+        except Exception:
+            pass
+
+    def say(self, text, error=False):
+        self.msg.config(text=text, foreground="#c92a2a" if error else "#333")
+
+    def start(self):
+        if self.busy:
+            return
+        url = self.url_var.get().strip()
+        if not url.startswith("http"):
+            self.say("Paste a link that starts with http first.", error=True)
+            return
+        if not downloader_installed() and not messagebox.askyesno(
+                "One-time setup", "The first time, the soundboard needs to download its YouTube downloader "
+                                  "(about 80 MB). Continue?", parent=self.win):
+            return
+        self.busy = True
+        self.go_btn.config(state="disabled")
+        self.bar.config(mode="indeterminate")
+        self.bar.start(15)
+        threading.Thread(target=self.work, args=(url,), daemon=True).start()
+
+    def work(self, url):
+        report = lambda kind, value: self.q.put((kind, value))
+        try:
+            updated = False
+            if not downloader_installed():
+                report("status", "Setting up the downloader (one time, about 80 MB). This can take a minute...")
+                ok, msg = install_downloader()
+                if not ok:
+                    raise RuntimeError("Couldn't set up the downloader. Check your internet connection.\n" + msg)
+                updated = True
+            elif time.time() - _dl_state().get("updated", 0) > DL_UPDATE_EVERY:
+                report("status", "Updating the downloader...")
+                updated = install_downloader()[0]
+            report("status", "Downloading...")
+            try:
+                title, path = download_audio(url, report)
+            except RuntimeError:
+                if updated:
+                    raise
+                report("status", "That didn't work. Updating the downloader and trying again...")
+                install_downloader()
+                report("status", "Downloading...")
+                title, path = download_audio(url, report)
+            report("done", (title, path))
+        except Exception as e:
+            report("error", str(e))
+
+    def poll(self):
+        if not self.win.winfo_exists():
+            return
+        while True:
+            try:
+                kind, value = self.q.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "status":
+                self.say(value)
+            elif kind == "progress":
+                if str(self.bar.cget("mode")) != "determinate":
+                    self.bar.stop()
+                    self.bar.config(mode="determinate")
+                self.bar["value"] = value
+            elif kind in ("done", "error"):
+                self.busy = False
+                self.go_btn.config(state="normal")
+                self.bar.stop()
+                self.bar.config(mode="determinate")
+                if kind == "done":
+                    title, path = value
+                    self.bar["value"] = 100
+                    self.app.add_sound(path, title)
+                    self.url_var.set("")
+                    self.say(f"Added “{title}”. Paste another link, or close this window.")
+                else:
+                    self.bar["value"] = 0
+                    self.say(value, error=True)
+        self.win.after(50, self.poll)
+
+    def close(self):
+        if self.busy and not messagebox.askyesno("Still downloading", "Close anyway? The download will finish "
+                                                 "in the background and the sound will still be added.",
+                                                 parent=self.win):
+            return
+        if self.busy:
+            self.win.withdraw()
+            self.app.orphan_link_dialog(self)
+        else:
+            self.win.destroy()
 
 
 def trimmed(sound, data):
@@ -658,6 +934,7 @@ class App:
         self.sound_bar = bar
         ttk.Button(bar, text="+ Add sounds", command=self.add_files).pack(side="left")
         ttk.Button(bar, text="+ Add folder", command=self.add_folder).pack(side="left", padx=4)
+        ttk.Button(bar, text="+ From YouTube", command=lambda: LinkDialog(self)).pack(side="left")
         self.stop_btn = ttk.Button(bar, command=self.mixer.stop_all)
         self.stop_btn.pack(side="right")
         self.stop_btn.bind("<Button-3>", self.stop_menu)
@@ -848,6 +1125,23 @@ class App:
         if d:
             self.add_paths(sorted(os.path.join(d, f) for f in os.listdir(d) if f.lower().endswith(AUDIO_EXTS)))
 
+    def add_sound(self, path, name):
+        if any(s["path"] == path for s in self.sounds):
+            return
+        self.sounds.append({"path": path, "name": name, "hotkey": ""})
+        self.preload([path])
+        self.render_sounds()
+        self.save_config()
+
+    def orphan_link_dialog(self, dlg):
+        """Keep a hidden link window alive until its download finishes, then clean it up."""
+        def check():
+            if dlg.busy:
+                self.root.after(500, check)
+            else:
+                dlg.win.destroy()
+        check()
+
     def add_paths(self, paths):
         have = {s["path"] for s in self.sounds}
         new = [p for p in paths if p and p not in have]
@@ -936,11 +1230,20 @@ class App:
         self.save_config()
 
     def remove(self, i):
-        name = self.sounds[i]["name"]
-        if not messagebox.askyesno("Remove sound", f"Remove “{name}” from the soundboard?\n\n"
-                                                   "The audio file itself stays on your computer."):
+        name, path = self.sounds[i]["name"], self.sounds[i]["path"]
+        downloaded = os.path.normcase(os.path.abspath(path)).startswith(
+            os.path.normcase(os.path.abspath(SOUNDS_DIR)) + os.sep)
+        note = ("It was downloaded from a link, so its file gets deleted too." if downloaded else
+                "The audio file itself stays on your computer.")
+        if not messagebox.askyesno("Remove sound", f"Remove “{name}” from the soundboard?\n\n{note}"):
             return
         self.sounds.pop(i)
+        self.cache.pop(path, None)
+        if downloaded:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         self.render_sounds()
         self.register_hotkeys()
         self.save_config()
