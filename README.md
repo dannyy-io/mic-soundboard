@@ -43,6 +43,7 @@ Discord's "Let's Check" mic test should now show your voice and any sound you cl
 - **Right-click "Stop all"** to give stopping its own hotkey.
 - **One sound at a time** stops the current sound when you start another one.
 - **Your mic** checkbox mutes your voice but still sends sounds.
+- **Noise suppression** removes keyboard clicks, mouse clicks and background noise from your voice only. Your sounds aren't touched. Keep Discord's own Noise Suppression on **None**, because it can't tell your sounds apart from noise. The first time you turn it on, it downloads a small filter (about 13 MB).
 - Your sounds list, hotkeys, volumes and devices are saved in the app's `data` folder, and updates never touch it. (Help → Open app folder.)
 
 ## Playing Spotify / YouTube / anything else into the call

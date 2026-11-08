@@ -11,6 +11,9 @@ Play any audio file through your microphone into Discord (or any voice chat).
 Setup steps are in README.md.
 """
 
+import ctypes
+import importlib
+import importlib.util
 import json
 import os
 import queue
@@ -131,6 +134,72 @@ class Voice:
         self.pos = {"cable": 0, "monitor": 0}
 
 
+# ───────────────────────────── noise suppression ─────────────────────────────
+# Uses RNNoise (the same kind of AI noise filter Discord and OBS use). Only the core
+# library file from the "pyrnnoise" package is used; its extra parts aren't needed.
+
+NOISE_PACKAGE = "pyrnnoise"
+
+
+def find_rnnoise_lib():
+    """Path to the RNNoise library if the package is installed, else None."""
+    importlib.invalidate_caches()
+    try:
+        spec = importlib.util.find_spec(NOISE_PACKAGE)   # finds it without running its __init__
+    except Exception:
+        return None
+    if not spec or not spec.submodule_search_locations:
+        return None
+    folder = list(spec.submodule_search_locations)[0]
+    for name in ("rnnoise.dll", "librnnoise.so", "librnnoise.dylib"):
+        path = os.path.join(folder, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def install_rnnoise():
+    """Download the noise filter. Returns (ok, message)."""
+    proc = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--disable-pip-version-check",
+                           "--no-deps", NOISE_PACKAGE],
+                          capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if proc.returncode != 0:
+        return False, (proc.stderr or proc.stdout or "pip failed")[-400:]
+    return (True, "") if find_rnnoise_lib() else (False, "The download finished but the filter file wasn't found.")
+
+
+class Denoiser:
+    """Removes keyboard clicks, fans and other background noise from mic audio (48 kHz mono)."""
+
+    def __init__(self, lib_path):
+        lib = ctypes.CDLL(lib_path)
+        lib.rnnoise_create.argtypes = [ctypes.c_void_p]
+        lib.rnnoise_create.restype = ctypes.c_void_p
+        lib.rnnoise_get_frame_size.restype = ctypes.c_int
+        lib.rnnoise_process_frame.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float),
+                                              ctypes.POINTER(ctypes.c_float)]
+        lib.rnnoise_process_frame.restype = ctypes.c_float
+        self.lib = lib
+        self.state = lib.rnnoise_create(None)
+        if not self.state:
+            raise OSError("Couldn't start the noise filter.")
+        self.n = int(lib.rnnoise_get_frame_size())          # 480 samples = 10 ms
+        self.buf = np.zeros(self.n, np.float32)
+        self.ptr = self.buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        self.pending = np.zeros(0, np.float32)               # leftover samples if blocks aren't 480
+
+    def process(self, mono):
+        data = np.concatenate([self.pending, mono]) if len(self.pending) else mono
+        whole = len(data) - len(data) % self.n
+        out = np.empty(whole, np.float32)
+        for i in range(0, whole, self.n):
+            self.buf[:] = data[i:i + self.n] * 32768.0       # RNNoise works in 16-bit sample units
+            self.lib.rnnoise_process_frame(self.state, self.ptr, self.ptr)
+            out[i:i + self.n] = self.buf * (1.0 / 32768.0)
+        self.pending = data[whole:].copy()
+        return out
+
+
 class Mixer:
     """Mixes the mic with playing sounds and feeds the cable + your headphones."""
 
@@ -146,6 +215,8 @@ class Mixer:
         self.sound_gain = 0.7
         self.monitor_gain = 0.5
         self.monitor_active = False
+        self.denoiser = None          # set when noise suppression is on
+        self.denoise_failed = None    # error text if the filter crashed while running
         self.streams = []
 
     # -- control (called from the GUI) --
@@ -211,6 +282,13 @@ class Mixer:
     # -- audio callbacks (run on audio threads) --
     def _mic_cb(self, indata, frames, time_info, status):
         mono = indata.mean(axis=1).astype(np.float32) if indata.shape[1] > 1 else indata[:, 0].copy()
+        den = self.denoiser
+        if den is not None:
+            try:
+                mono = den.process(mono)
+            except Exception as e:      # never let the filter kill the mic
+                self.denoiser = None
+                self.denoise_failed = str(e)
         self.mic_level = float(np.abs(mono).max()) if len(mono) else 0.0
         with self.lock:
             self.mic_fifo.append(mono)
@@ -307,6 +385,8 @@ class App:
         self.render_sounds()
         self.register_hotkeys()
         self.preload([s["path"] for s in self.sounds])
+        if self.noise_var.get():
+            self.enable_noise(ask=False)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         if self.outputs.get(self.cable_var.get()) is not None:
             self.start(quiet=True)
@@ -365,6 +445,11 @@ class App:
         self.snd_vol = self.slider(mix, 1, "sound_vol", 70, 150)
         ttk.Label(mix, text="Sounds → your ears").grid(row=2, column=0, sticky="w", **pad)
         self.mon_vol = self.slider(mix, 2, "monitor_vol", 50, 150)
+        self.noise_var = tk.BooleanVar(value=self.cfg.get("noise_suppression", False))
+        ttk.Checkbutton(mix, text="Noise suppression: remove keyboard, mouse and background noise from your mic "
+                                  "(your sounds aren't affected)",
+                        variable=self.noise_var, command=self.on_noise_toggle).grid(
+            row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(3, 6))
 
         self.update_bar = tk.Frame(self.root, bg="#2f9e44")
         self.update_label = tk.Label(self.update_bar, bg="#2f9e44", fg="white", font=("Segoe UI", 10, "bold"))
@@ -737,6 +822,8 @@ class App:
                 return
             elif kind == "update_checked":
                 self.on_update_checked(*ev[1:])
+            elif kind == "noise_installed":
+                self.finish_noise_install(*ev[1:])
             elif kind == "load_error":
                 self.set_status(f"Couldn't read {os.path.basename(ev[1])}: {ev[2]}")
             elif kind == "hotkey_read":
@@ -749,6 +836,11 @@ class App:
 
         if getattr(self, "closed", False):
             return
+        if self.mixer.denoise_failed:
+            err, self.mixer.denoise_failed = self.mixer.denoise_failed, None
+            self.noise_var.set(False)
+            self.save_config()
+            self.set_status("Noise suppression stopped because of an error, so it was turned off: " + err)
         lvl = self.mixer.mic_level * self.mixer.mic_gain if (self.running and self.mixer.mic_on) else 0.0
         self._level = max(min(lvl, 1.0), self._level * 0.8)
         self.level["value"] = self._level
@@ -759,13 +851,66 @@ class App:
                 self.set_status("Audio stopped (a device was unplugged or changed). Click Start.")
             else:
                 playing = self.mixer.playing_names()
-                if playing:
+                if getattr(self, "_noise_installing", False):
+                    self.set_status("Downloading the noise filter (about 13 MB)... your mic keeps working meanwhile.")
+                elif playing:
                     self.set_status("▶ Playing: " + ", ".join(playing))
                 else:
-                    self.set_status(f"Running: mic + sounds → {self.cable_var.get()}")
+                    extra = "   ·   noise suppression on" if self.mixer.denoiser is not None else ""
+                    self.set_status(f"Running: mic + sounds → {self.cable_var.get()}{extra}")
         elif self._last_status in (None, "Stopped") or (self._last_status or "").startswith(("Running", "▶")):
             self.set_status("Stopped")
         self.root.after(30, self.tick)
+
+    # ---------- noise suppression ----------
+    def on_noise_toggle(self):
+        if self.noise_var.get():
+            self.enable_noise(ask=True)
+        else:
+            self.mixer.denoiser = None
+            self.save_config()
+
+    def enable_noise(self, ask):
+        lib = find_rnnoise_lib()
+        if lib:
+            self.start_denoiser(lib)
+            return
+        if getattr(self, "_noise_installing", False):
+            return
+        if ask and not messagebox.askyesno(
+                "Noise suppression",
+                "Noise suppression needs a small download (about 13 MB) the first time.\n\nDownload it now?"):
+            self.noise_var.set(False)
+            return
+        self._noise_installing = True
+        self.set_status("Downloading the noise filter (about 13 MB)... your mic keeps working meanwhile.")
+
+        def work():
+            ok, msg = install_rnnoise()
+            self.events.put(("noise_installed", ok, msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def finish_noise_install(self, ok, msg):
+        self._noise_installing = False
+        if not ok:
+            self.noise_var.set(False)
+            self.save_config()
+            messagebox.showerror("Noise suppression", "Couldn't download the noise filter. Check your internet "
+                                                      f"connection and try again.\n\n{msg}")
+            return
+        if self.noise_var.get():
+            self.start_denoiser(find_rnnoise_lib())
+
+    def start_denoiser(self, lib):
+        try:
+            self.mixer.denoiser = Denoiser(lib)
+        except Exception as e:
+            self.mixer.denoiser = None
+            self.noise_var.set(False)
+            messagebox.showerror("Noise suppression", f"The noise filter couldn't start:\n\n{e}")
+        else:
+            self.set_status("Noise suppression is on.")
+        self.save_config()
 
     # ---------- app window, single copy, updates ----------
     def set_icon(self):
@@ -935,6 +1080,7 @@ class App:
             "sound_vol": self.snd_vol.get(),
             "monitor_vol": self.mon_vol.get(),
             "one_at_a_time": self.exclusive_var.get(),
+            "noise_suppression": self.noise_var.get(),
             "stop_hotkey": self.stop_hotkey,
             "sounds": self.sounds,
         }

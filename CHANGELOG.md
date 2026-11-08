@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.0
+- New: Noise suppression for your mic. Tick it under Volume to remove keyboard clicks, mouse clicks and background noise. Only your voice is filtered, so your sounds play normally.
+- The first time you turn it on, it downloads a small filter (about 13 MB).
+- If you were using AMD Noise Suppression, you can turn that off and set "Your microphone" back to your real mic.
+
 ## 1.0.0
 - First version as an installable app: Start Menu and desktop icons, and automatic updates from GitHub.
 - Play sounds through your mic into Discord, with global hotkeys, separate volumes for the call and your ears, and a "Stop all" button.
