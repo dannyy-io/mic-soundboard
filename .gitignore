@@ -1,0 +1,4 @@
+data/
+.venv/
+__pycache__/
+soundboard_config.json
