@@ -220,9 +220,18 @@ class Mixer:
         self.streams = []
 
     # -- control (called from the GUI) --
-    def play(self, data, name):
+    def play(self, data, name, ears_only=False):
+        v = Voice(data, name)
+        if ears_only:                      # preview: skip the call, play only in your headphones
+            v.pos["cable"] = len(data)
         with self.lock:
-            self.voices.append(Voice(data, name))
+            self.voices.append(v)
+        return v
+
+    def stop_voice(self, v):
+        with self.lock:
+            if v in self.voices:
+                self.voices.remove(v)
 
     def stop_all(self):
         with self.lock:
@@ -356,6 +365,194 @@ class Mixer:
         self._write(outdata, out)
 
 
+def trimmed(sound, data):
+    """The part of a sound between its trim start and end (whole sound if not trimmed)."""
+    a = int(float(sound.get("start") or 0) * SR)
+    b = int(float(sound["end"]) * SR) if sound.get("end") else len(data)
+    a = max(0, min(a, len(data)))
+    b = max(a, min(b, len(data)))
+    return data[a:b]
+
+
+def fmt_time(t):
+    m, sec = divmod(max(t, 0.0), 60)
+    return f"{int(m)}:{sec:05.2f}"
+
+
+class TrimDialog:
+    """Pick where a sound starts and ends. The original file is never changed."""
+    W, H = 640, 150
+    MIN_LEN = 0.05
+
+    def __init__(self, app, index):
+        self.app, self.i = app, index
+        self.sound = app.sounds[index]
+        data = app.get_audio(self.sound["path"])
+        if data is None or len(data) < 2:
+            return
+        self.data = data
+        self.total = len(data) / SR
+        self.start = min(float(self.sound.get("start") or 0), self.total)
+        self.end = float(self.sound.get("end") or self.total)
+        self.end = min(max(self.end, self.start + self.MIN_LEN), self.total)
+        self.preview = None
+        self.drag = None
+
+        w = self.win = tk.Toplevel(app.root)
+        w.title(f"Trim: {self.sound['name']}")
+        w.transient(app.root)
+        w.resizable(False, False)
+        w.protocol("WM_DELETE_WINDOW", self.close)
+
+        ttk.Label(w, justify="left",
+                  text="Drag the green line (start) and the red line (end), or type the times below.\n"
+                       "Preview plays only in your headphones, not in the call.").pack(anchor="w", padx=12, pady=(12, 6))
+        self.canvas = tk.Canvas(w, width=self.W, height=self.H, bg="#1e1f22", highlightthickness=0,
+                                cursor="sb_h_double_arrow")
+        self.canvas.pack(padx=12)
+        self.draw_wave()
+        self.canvas.bind("<Button-1>", self.on_press)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", lambda e: setattr(self, "drag", None))
+
+        row = ttk.Frame(w)
+        row.pack(fill="x", padx=12, pady=8)
+        self.start_var, self.end_var = tk.StringVar(), tk.StringVar()
+        for label, var in (("Start (seconds)", self.start_var), ("End (seconds)", self.end_var)):
+            ttk.Label(row, text=label).pack(side="left")
+            sb_ = ttk.Spinbox(row, from_=0, to=round(self.total, 2), increment=0.1, width=8, textvariable=var,
+                              command=self.on_typed)
+            sb_.pack(side="left", padx=(4, 14))
+            sb_.bind("<Return>", lambda e: self.on_typed())
+            sb_.bind("<FocusOut>", lambda e: self.on_typed())
+        self.len_label = ttk.Label(row)
+        self.len_label.pack(side="left")
+
+        btns = ttk.Frame(w)
+        btns.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Button(btns, text="▶ Preview", command=self.play_preview).pack(side="left")
+        ttk.Button(btns, text="■ Stop", command=self.stop_preview).pack(side="left", padx=4)
+        ttk.Button(btns, text="Reset", command=self.reset).pack(side="left", padx=(12, 0))
+        ttk.Button(btns, text="Cancel", command=self.close).pack(side="right")
+        ttk.Button(btns, text="Save", command=self.save).pack(side="right", padx=4)
+
+        self.update_marks()
+        w.grab_set()
+        self.tick()
+
+    # -- drawing --
+    def x_of(self, t):
+        return t / self.total * self.W
+
+    def t_of(self, x):
+        return min(max(x, 0), self.W) / self.W * self.total
+
+    def draw_wave(self):
+        mono = np.abs(self.data).max(axis=1)
+        edges = np.linspace(0, len(mono), self.W + 1).astype(int)
+        peaks = np.array([mono[a:b].max() if b > a else 0.0 for a, b in zip(edges[:-1], edges[1:])])
+        peaks = peaks / max(float(peaks.max()), 1e-6)
+        mid = self.H / 2
+        for x, p in enumerate(peaks):
+            h = max(1.0, p * (mid - 8))
+            self.canvas.create_line(x, mid - h, x, mid + h, fill="#5865f2")
+        self.shade_l = self.canvas.create_rectangle(0, 0, 0, self.H, fill="#000000", stipple="gray50", width=0)
+        self.shade_r = self.canvas.create_rectangle(0, 0, 0, self.H, fill="#000000", stipple="gray50", width=0)
+        self.line_s = self.canvas.create_line(0, 0, 0, self.H, fill="#43b581", width=3)
+        self.line_e = self.canvas.create_line(0, 0, 0, self.H, fill="#f04747", width=3)
+        self.head = self.canvas.create_line(-5, 0, -5, self.H, fill="white", width=1)
+
+    def update_marks(self):
+        xs, xe = self.x_of(self.start), self.x_of(self.end)
+        self.canvas.coords(self.shade_l, 0, 0, xs, self.H)
+        self.canvas.coords(self.shade_r, xe, 0, self.W, self.H)
+        self.canvas.coords(self.line_s, xs, 0, xs, self.H)
+        self.canvas.coords(self.line_e, xe, 0, xe, self.H)
+        self.start_var.set(f"{self.start:.2f}")
+        self.end_var.set(f"{self.end:.2f}")
+        self.len_label.config(text=f"Plays {fmt_time(self.end - self.start)} of {fmt_time(self.total)}")
+
+    # -- editing --
+    def set_times(self, start=None, end=None):
+        if start is not None:
+            self.start = min(max(start, 0.0), self.end - self.MIN_LEN)
+        if end is not None:
+            self.end = max(min(end, self.total), self.start + self.MIN_LEN)
+        self.update_marks()
+
+    def on_press(self, e):
+        xs, xe = self.x_of(self.start), self.x_of(self.end)
+        self.drag = "start" if abs(e.x - xs) <= abs(e.x - xe) else "end"
+        self.on_drag(e)
+
+    def on_drag(self, e):
+        if self.drag == "start":
+            self.set_times(start=self.t_of(e.x))
+        elif self.drag == "end":
+            self.set_times(end=self.t_of(e.x))
+
+    def on_typed(self):
+        try:
+            start, end = float(self.start_var.get()), float(self.end_var.get())
+        except ValueError:
+            self.update_marks()
+            return
+        self.set_times(start=min(start, self.end - self.MIN_LEN))
+        self.set_times(end=end)
+
+    def reset(self):
+        self.start, self.end = 0.0, self.total
+        self.update_marks()
+
+    # -- preview --
+    def play_preview(self):
+        self.stop_preview()
+        if not self.app.running:
+            messagebox.showinfo("Preview", "Press Start in the main window first.", parent=self.win)
+            return
+        if not self.app.mixer.monitor_active:
+            messagebox.showinfo("Preview", "Pick your headphones under “Hear sounds on” to preview.", parent=self.win)
+            return
+        part = self.data[int(self.start * SR):int(self.end * SR)]
+        self.preview = self.app.mixer.play(part, self.sound["name"] + " (preview)", ears_only=True)
+        self.preview_from = self.start
+
+    def stop_preview(self):
+        if self.preview is not None:
+            self.app.mixer.stop_voice(self.preview)
+            self.preview = None
+        self.canvas.coords(self.head, -5, 0, -5, self.H)
+
+    def tick(self):
+        if not self.win.winfo_exists():
+            return
+        v = self.preview
+        if v is not None:
+            if v.pos["monitor"] >= len(v.data) or v not in self.app.mixer.voices:
+                self.stop_preview()
+            else:
+                x = self.x_of(self.preview_from + v.pos["monitor"] / SR)
+                self.canvas.coords(self.head, x, 0, x, self.H)
+        self.win.after(30, self.tick)
+
+    # -- finish --
+    def save(self):
+        self.on_typed()
+        self.sound["start"] = round(self.start, 3) if self.start > 0.005 else 0
+        self.sound["end"] = round(self.end, 3) if self.end < self.total - 0.005 else None
+        self.app.render_sounds()
+        self.app.save_config()
+        self.close()
+
+    def close(self):
+        self.stop_preview()
+        try:
+            self.win.grab_release()
+        except Exception:
+            pass
+        self.win.destroy()
+
+
 # ───────────────────────────────── GUI ─────────────────────────────────
 
 class App:
@@ -469,6 +666,10 @@ class App:
         ttk.Checkbutton(bar, text="One sound at a time", variable=self.exclusive_var,
                         command=self.save_config).pack(side="right", padx=8)
 
+        ttk.Label(self.root, foreground="#666",
+                  text="Right-click a sound to trim it, rename it, give it a hotkey or remove it.").pack(
+            fill="x", padx=10, pady=(4, 0))
+
         outer = ttk.Frame(self.root)
         outer.pack(fill="both", expand=True, padx=8, pady=6)
         self.canvas = tk.Canvas(outer, highlightthickness=0)
@@ -507,7 +708,8 @@ class App:
                       ).grid(row=0, column=0, columnspan=COLUMNS, pady=40)
             return
         for i, s in enumerate(self.sounds):
-            text = s["name"] + (f"\n[{s['hotkey']}]" if s.get("hotkey") else "")
+            cut = " ✂" if (s.get("start") or s.get("end")) else ""
+            text = s["name"] + cut + (f"\n[{s['hotkey']}]" if s.get("hotkey") else "")
             b = tk.Button(self.grid_frame, text=text, wraplength=140, height=3,
                           command=lambda i=i: self.play(i))
             b.grid(row=i // COLUMNS, column=i % COLUMNS, sticky="ew", padx=3, pady=3)
@@ -689,7 +891,7 @@ class App:
             return
         if self.exclusive_var.get():
             self.mixer.stop_all()
-        self.mixer.play(data, s["name"])
+        self.mixer.play(trimmed(s, data), s["name"])
 
     def sound_menu(self, e, i):
         s = self.sounds[i]
@@ -698,13 +900,15 @@ class App:
         m.add_command(label="Set hotkey…", command=lambda: self.ask_hotkey(i))
         if s.get("hotkey"):
             m.add_command(label="Clear hotkey", command=lambda: self.assign_hotkey(i, ""))
+        m.add_command(label="Trim…", command=lambda: TrimDialog(self, i))
         m.add_command(label="Rename…", command=lambda: self.rename(i))
         m.add_separator()
         if i > 0:
             m.add_command(label="Move left", command=lambda: self.move(i, -1))
         if i < len(self.sounds) - 1:
             m.add_command(label="Move right", command=lambda: self.move(i, 1))
-        m.add_command(label="Remove", command=lambda: self.remove(i))
+        m.add_separator()
+        m.add_command(label="Remove from soundboard", command=lambda: self.remove(i))
         m.tk_popup(e.x_root, e.y_root)
 
     def stop_menu(self, e):
@@ -732,6 +936,10 @@ class App:
         self.save_config()
 
     def remove(self, i):
+        name = self.sounds[i]["name"]
+        if not messagebox.askyesno("Remove sound", f"Remove “{name}” from the soundboard?\n\n"
+                                                   "The audio file itself stays on your computer."):
+            return
         self.sounds.pop(i)
         self.render_sounds()
         self.register_hotkeys()
