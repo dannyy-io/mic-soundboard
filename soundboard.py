@@ -456,7 +456,11 @@ def cookies_file():
 
 
 def friendly_download_error(text, url=""):
+    print("[download error]", text, flush=True)          # full text goes to data/app.log
+    text = re.sub(r"\s+", " ", re.sub(r"^ERROR:\s*", "", text.strip()))   # also turns odd spaces into normal ones
+    text = re.sub(r"^\[[^\]]+\]\s*[\w-]+:\s*", "", text)               # drop "[youtube] abc123:"
     low = text.lower()
+    reason = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0]             # YouTube's own first sentence
     if ("could not copy" in low and "cookie" in low) or "failed to decrypt" in low or "dpapi" in low:
         return ("Couldn't read your login from that browser. Chrome, Edge and Brave lock it while they're open. "
                 "Close that browser completely and try again, or pick Firefox, or use a cookies file "
@@ -469,10 +473,12 @@ def friendly_download_error(text, url=""):
         return ("Instagram wants you to be logged in to download this. Under “Use my browser login”, pick the "
                 "browser you're logged into Instagram with, and try again.")
     if "sign in to confirm" in low and "age" in low:
-        return "That video is age-restricted, so it can't be downloaded without signing in."
-    if "not a bot" in low or "sign in to confirm" in low:
-        return ("YouTube wants to check that you're not a bot. Wait a few minutes and try again, or pick the "
-                "browser you're logged into YouTube with under “Use my browser login”.")
+        return ("That video is age-restricted. Under “Use my browser login”, pick the browser you're logged into "
+                "YouTube with (Firefox works best) and try again.")
+    if "not a bot" in low or "sign in" in low or "--cookies" in low:
+        return (f"YouTube wants you to be logged in for this one (it said: “{reason}”).\n"
+                "Under “Use my browser login”, pick the browser you're logged into YouTube with "
+                "(Firefox works best) and try again.")
     if "private video" in low:
         return "That video is private."
     if "unsupported url" in low or "is not a valid url" in low:
@@ -481,7 +487,7 @@ def friendly_download_error(text, url=""):
         return "That link doesn't lead to anything (page not found)."
     if "video unavailable" in low or "not available" in low:
         return "That video isn't available (it may be deleted, private, or blocked)."
-    return re.sub(r"^ERROR:\s*", "", text.strip())[-300:] or "The download failed."
+    return text[:300] or "The download failed."
 
 
 def download_audio(url, report, browser=None):

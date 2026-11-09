@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.4.1
+- When YouTube asks you to log in (for example "confirm you're not a bot"), the error now says so plainly and tells you what to do, instead of showing a wall of links.
+
 ## 1.4.0
 - Instagram downloads: paste an Instagram reel or post link in "+ From YouTube / Instagram".
 - New "Use my browser login" option for sites that need you logged in (Instagram usually does). Firefox works best.
