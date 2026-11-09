@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.0
+- Instagram downloads: paste an Instagram reel or post link in "+ From YouTube / Instagram".
+- New "Use my browser login" option for sites that need you logged in (Instagram usually does). Firefox works best.
+- "Use a cookies file…" for when reading the browser login doesn't work. If you already saved a cookies file for Shorts Uploader, it's used automatically.
+
 ## 1.3.0
 - New: "+ From YouTube" button. Paste a YouTube link (TikTok, SoundCloud and many other sites work too) and its audio is downloaded and added as a new sound automatically.
 - The first time, it downloads the downloader (about 80 MB). It keeps itself updated, because YouTube changes often.

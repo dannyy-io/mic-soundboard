@@ -104,6 +104,8 @@ DL_PACKAGES = ["yt-dlp[default]", "imageio-ffmpeg"]
 DL_OPTIONAL = ["deno"]                              # JavaScript runtime that YouTube downloads need
 DL_UPDATE_EVERY = 2 * 24 * 60 * 60                  # keep the downloader fresh; YouTube changes often
 DL_MAX_MINUTES = 15
+COOKIES_PATH = os.path.join(DATA_DIR, "cookies.txt")
+BROWSERS = ["Off", "Firefox", "Chrome", "Edge", "Brave", "Opera"]
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 CABLE_WORDS = ("cable input", "voicemeeter input", "voicemeeter aux input", "vb-audio")
 
@@ -444,12 +446,33 @@ def _tool_env():
     return env
 
 
-def friendly_download_error(text):
+def cookies_file():
+    """A cookies.txt to use when no browser is picked: ours, or the one saved for Shorts Uploader."""
+    candidates = [COOKIES_PATH]
+    if os.environ.get("LOCALAPPDATA"):
+        candidates.append(os.path.join(os.environ["LOCALAPPDATA"], "Programs", "Shorts Uploader", "data",
+                                       "cookies.txt"))
+    return next((p for p in candidates if os.path.exists(p)), None)
+
+
+def friendly_download_error(text, url=""):
     low = text.lower()
+    if ("could not copy" in low and "cookie" in low) or "failed to decrypt" in low or "dpapi" in low:
+        return ("Couldn't read your login from that browser. Chrome, Edge and Brave lock it while they're open. "
+                "Close that browser completely and try again, or pick Firefox, or use a cookies file "
+                "(see “Use a cookies file…”).")
+    if "could not find" in low and "cookies database" in low:
+        return ("Couldn't find a login in that browser on this PC. Pick the browser you actually use for "
+                "Instagram, and make sure you're logged in there.")
+    if "instagram" in url.lower() and ("login" in low or "cookies" in low or "rate-limit" in low
+                                       or "empty media response" in low or "not available" in low):
+        return ("Instagram wants you to be logged in to download this. Under “Use my browser login”, pick the "
+                "browser you're logged into Instagram with, and try again.")
     if "sign in to confirm" in low and "age" in low:
         return "That video is age-restricted, so it can't be downloaded without signing in."
     if "not a bot" in low or "sign in to confirm" in low:
-        return "YouTube wants to check that you're not a bot. Wait a few minutes and try again."
+        return ("YouTube wants to check that you're not a bot. Wait a few minutes and try again, or pick the "
+                "browser you're logged into YouTube with under “Use my browser login”.")
     if "private video" in low:
         return "That video is private."
     if "unsupported url" in low or "is not a valid url" in low:
@@ -461,7 +484,7 @@ def friendly_download_error(text):
     return re.sub(r"^ERROR:\s*", "", text.strip())[-300:] or "The download failed."
 
 
-def download_audio(url, report):
+def download_audio(url, report, browser=None):
     """Download a link's audio as a 48 kHz WAV in data/sounds. Returns (title, path).
     report(kind, value) is called with ("progress", percent) and ("status", text)."""
     os.makedirs(SOUNDS_DIR, exist_ok=True)
@@ -475,6 +498,10 @@ def download_audio(url, report):
            "--max-filesize", "300M",
            "-o", os.path.join(SOUNDS_DIR, "%(title).80B [%(id)s].%(ext)s"),
            "-O", "after_move:%(.{title,filepath})j"]
+    if browser and browser != "Off":
+        cmd += ["--cookies-from-browser", browser.lower()]
+    elif cookies_file():
+        cmd += ["--cookies", cookies_file()]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                             errors="replace", env=_tool_env(), creationflags=NO_WINDOW, bufsize=1)
     result, errors = None, []
@@ -484,7 +511,7 @@ def download_audio(url, report):
             m = re.search(r"([\d.]+)%", line)
             if m:
                 report("progress", float(m.group(1)))
-        elif line.startswith("{"):
+        elif line.startswith("{") and result is None:     # posts with several videos: keep the first
             try:
                 result = json.loads(line)
             except ValueError:
@@ -497,7 +524,7 @@ def download_audio(url, report):
     if result and result.get("filepath") and os.path.exists(result["filepath"]):
         return result.get("title") or os.path.basename(result["filepath"]), result["filepath"]
     if errors:
-        raise RuntimeError(friendly_download_error(errors[-1]))
+        raise RuntimeError(friendly_download_error(errors[-1], url))
     raise RuntimeError(f"Nothing was downloaded. Videos longer than {DL_MAX_MINUTES} minutes are skipped, "
                        "so try a shorter one.")
 
@@ -510,12 +537,12 @@ class LinkDialog:
         self.q = queue.Queue()
         self.busy = False
         w = self.win = tk.Toplevel(app.root)
-        w.title("Add a sound from a link")
+        w.title("Add a sound from YouTube, Instagram or TikTok")
         w.transient(app.root)
         w.resizable(False, False)
         w.protocol("WM_DELETE_WINDOW", self.close)
 
-        ttk.Label(w, text="Paste a YouTube link (TikTok, SoundCloud and many other sites work too):").pack(
+        ttk.Label(w, text="Paste a YouTube, Instagram or TikTok link (SoundCloud and many other sites work too):").pack(
             anchor="w", padx=12, pady=(12, 4))
         row = ttk.Frame(w)
         row.pack(fill="x", padx=12)
@@ -524,6 +551,18 @@ class LinkDialog:
         self.entry.pack(side="left", fill="x", expand=True)
         self.entry.bind("<Return>", lambda e: self.start())
         ttk.Button(row, text="Paste", command=self.paste).pack(side="left", padx=(6, 0))
+
+        row1 = ttk.Frame(w)
+        row1.pack(fill="x", padx=12, pady=(8, 0))
+        ttk.Label(row1, text="Use my browser login:").pack(side="left")
+        self.browser_var = tk.StringVar(value=app.cfg.get("link_browser", "Off"))
+        cb = ttk.Combobox(row1, textvariable=self.browser_var, values=BROWSERS, state="readonly", width=10)
+        cb.pack(side="left", padx=6)
+        cb.bind("<<ComboboxSelected>>", lambda e: self.remember_browser())
+        ttk.Button(row1, text="Use a cookies file…", command=self.pick_cookies).pack(side="left", padx=(6, 0))
+        ttk.Label(w, foreground="#666", wraplength=560, justify="left",
+                  text="Instagram usually needs this: pick the browser you're logged into Instagram with "
+                       "(Firefox works best). Leave it Off for YouTube.").pack(anchor="w", padx=12, pady=(2, 0))
 
         row2 = ttk.Frame(w)
         row2.pack(fill="x", padx=12, pady=10)
@@ -551,6 +590,30 @@ class LinkDialog:
         except Exception:
             pass
 
+    def remember_browser(self):
+        self.app.cfg["link_browser"] = self.browser_var.get()
+        self.app.save_config()
+
+    def pick_cookies(self):
+        messagebox.showinfo(
+            "Cookies file", "A cookies file lets downloads use your login without reading it from a browser.\n\n"
+                            "1. Install a “Get cookies.txt LOCALLY” extension in your browser.\n"
+                            "2. Open instagram.com (logged in) and export cookies with it.\n"
+                            "3. Pick that file in the next window.\n\n"
+                            "It's used whenever “Use my browser login” is Off.", parent=self.win)
+        path = filedialog.askopenfilename(parent=self.win, title="Pick your cookies.txt",
+                                          filetypes=[("Cookies file", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            shutil.copy2(path, COOKIES_PATH)
+        except OSError as e:
+            self.say(f"Couldn't save the cookies file: {e}", error=True)
+            return
+        self.browser_var.set("Off")
+        self.remember_browser()
+        self.say("Cookies file saved. Downloads will use it while “Use my browser login” is Off.")
+
     def say(self, text, error=False):
         self.msg.config(text=text, foreground="#c92a2a" if error else "#333")
 
@@ -569,9 +632,9 @@ class LinkDialog:
         self.go_btn.config(state="disabled")
         self.bar.config(mode="indeterminate")
         self.bar.start(15)
-        threading.Thread(target=self.work, args=(url,), daemon=True).start()
+        threading.Thread(target=self.work, args=(url, self.browser_var.get()), daemon=True).start()
 
-    def work(self, url):
+    def work(self, url, browser):
         report = lambda kind, value: self.q.put((kind, value))
         try:
             updated = False
@@ -586,14 +649,14 @@ class LinkDialog:
                 updated = install_downloader()[0]
             report("status", "Downloading...")
             try:
-                title, path = download_audio(url, report)
-            except RuntimeError:
-                if updated:
+                title, path = download_audio(url, report, browser)
+            except RuntimeError as e:
+                if updated or any(w in str(e) for w in ("logged in", "login", "private", "15 minutes")):
                     raise
                 report("status", "That didn't work. Updating the downloader and trying again...")
                 install_downloader()
                 report("status", "Downloading...")
-                title, path = download_audio(url, report)
+                title, path = download_audio(url, report, browser)
             report("done", (title, path))
         except Exception as e:
             report("error", str(e))
@@ -934,7 +997,7 @@ class App:
         self.sound_bar = bar
         ttk.Button(bar, text="+ Add sounds", command=self.add_files).pack(side="left")
         ttk.Button(bar, text="+ Add folder", command=self.add_folder).pack(side="left", padx=4)
-        ttk.Button(bar, text="+ From YouTube", command=lambda: LinkDialog(self)).pack(side="left")
+        ttk.Button(bar, text="+ From YouTube / Instagram", command=lambda: LinkDialog(self)).pack(side="left")
         self.stop_btn = ttk.Button(bar, command=self.mixer.stop_all)
         self.stop_btn.pack(side="right")
         self.stop_btn.bind("<Button-3>", self.stop_menu)
@@ -1592,6 +1655,7 @@ class App:
             "monitor_vol": self.mon_vol.get(),
             "one_at_a_time": self.exclusive_var.get(),
             "noise_suppression": self.noise_var.get(),
+            "link_browser": self.cfg.get("link_browser", "Off"),
             "stop_hotkey": self.stop_hotkey,
             "sounds": self.sounds,
         }

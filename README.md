@@ -39,7 +39,8 @@ Discord's "Let's Check" mic test should now show your voice and any sound you cl
 ## Using it
 
 - **Add sounds / Add folder** to load files. Click a button to play it into the call.
-- **+ From YouTube**: paste a link (YouTube, TikTok, SoundCloud and many more) and its audio is downloaded and added as a sound. The first time, it sets up the downloader (about 80 MB). Videos up to 15 minutes. Downloaded sounds are kept in the app's `data\sounds` folder.
+- **+ From YouTube / Instagram**: paste a link (YouTube, TikTok, SoundCloud and many more) and its audio is downloaded and added as a sound. The first time, it sets up the downloader (about 80 MB). Videos up to 15 minutes. Downloaded sounds are kept in the app's `data\sounds` folder.
+- **Instagram** usually needs you to be logged in: in that window, set **Use my browser login** to the browser you're logged into Instagram with (Firefox works most reliably). Chrome, Edge and Brave lock their login while they're open, so if that fails, close the browser completely and retry, or use **Use a cookies file…** (export one with a "Get cookies.txt LOCALLY" extension). A cookies file saved for Shorts Uploader is picked up automatically.
 - **Right-click a sound** to **trim** it, set a global **hotkey** (it works while Discord or a game is focused), rename, reorder or remove it.
 - **Trim** lets you cut a long intro or ending: drag the green (start) and red (end) lines on the waveform, then **Preview** to hear it in your headphones only. The original file is never changed, and **Reset** brings back the whole sound.
 - **Right-click "Stop all"** to give stopping its own hotkey.
