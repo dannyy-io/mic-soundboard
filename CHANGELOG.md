@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.4.2
+- "Use a cookies file…" now adds to your saved logins instead of replacing them, so you can add one file for YouTube and another for Instagram.
+
 ## 1.4.1
 - When YouTube asks you to log in (for example "confirm you're not a bot"), the error now says so plainly and tells you what to do, instead of showing a wall of links.
 

@@ -446,6 +446,38 @@ def _tool_env():
     return env
 
 
+def merge_cookies(new_path):
+    """Add a cookies.txt to ours, so YouTube and Instagram logins can live in one file.
+    Returns the number of cookies read from the new file."""
+    def read(path):
+        rows = {}
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.rstrip("\r\n")
+                    if line.startswith("#HttpOnly_"):
+                        key_line = line[len("#HttpOnly_"):]
+                    elif not line or line.startswith("#"):
+                        continue
+                    else:
+                        key_line = line
+                    parts = key_line.split("\t")
+                    if len(parts) >= 7:
+                        rows[(parts[0], parts[2], parts[5])] = line   # domain, path, name
+        except OSError:
+            pass
+        return rows
+    new = read(new_path)
+    if not new:
+        raise ValueError("That file doesn't look like a cookies.txt export (Netscape format).")
+    merged = read(COOKIES_PATH)
+    merged.update(new)
+    with open(COOKIES_PATH, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# Netscape HTTP Cookie File\n")
+        f.write("\n".join(merged.values()) + "\n")
+    return len(new)
+
+
 def cookies_file():
     """A cookies.txt to use when no browser is picked: ours, or the one saved for Shorts Uploader."""
     candidates = [COOKIES_PATH]
@@ -604,21 +636,24 @@ class LinkDialog:
         messagebox.showinfo(
             "Cookies file", "A cookies file lets downloads use your login without reading it from a browser.\n\n"
                             "1. Install a “Get cookies.txt LOCALLY” extension in your browser.\n"
-                            "2. Open instagram.com (logged in) and export cookies with it.\n"
+                            "2. Open youtube.com or instagram.com (logged in) and click Export in it.\n"
                             "3. Pick that file in the next window.\n\n"
-                            "It's used whenever “Use my browser login” is Off.", parent=self.win)
+                            "You can add one for YouTube and one for Instagram; they're kept together. "
+                            "It's used whenever “Use my browser login” is Off.\n\n"
+                            "Keep that file private: it works like your login.", parent=self.win)
         path = filedialog.askopenfilename(parent=self.win, title="Pick your cookies.txt",
                                           filetypes=[("Cookies file", "*.txt"), ("All files", "*.*")])
         if not path:
             return
         try:
-            shutil.copy2(path, COOKIES_PATH)
-        except OSError as e:
-            self.say(f"Couldn't save the cookies file: {e}", error=True)
+            n = merge_cookies(path)
+        except (OSError, ValueError) as e:
+            self.say(f"Couldn't use that file: {e}", error=True)
             return
         self.browser_var.set("Off")
         self.remember_browser()
-        self.say("Cookies file saved. Downloads will use it while “Use my browser login” is Off.")
+        self.say(f"Saved ({n} cookies). Downloads use it while “Use my browser login” is Off. "
+                 "You can delete the exported file from your Downloads folder now.")
 
     def say(self, text, error=False):
         self.msg.config(text=text, foreground="#c92a2a" if error else "#333")
